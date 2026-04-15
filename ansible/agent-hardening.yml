@@ -1,0 +1,328 @@
+---
+# agent-hardening.yml
+# Idempotent setup of WSL2 AI agent isolation
+# Usage: ansible-playbook agent-hardening.yml --ask-become-pass
+
+- name: AI agent hardening
+  hosts: localhost
+  become: true
+
+  vars_files:
+    - ../group_vars/all.yml
+  vars:
+    squid_whitelist: "{{ squid_whitelist_base + personal_domains }}"
+    squid_whitelist_base:
+      - .anthropic.com
+      - .claude.ai
+      - .claude.com
+      - .github.com
+      - .githubcopilot.com
+      - .githubusercontent.com
+      - .npmjs.org
+      - .nodejs.org
+      - .maven.org
+      - .repo1.maven.org
+      - .repo.maven.apache.org
+      - .plugins.gradle.org
+      - .services.gradle.org
+      - .downloads.gradle.org
+      - .static.rust-lang.org
+      - .crates.io
+      - .pypi.org
+      - .files.pythonhosted.org
+      - .letsencrypt.org
+      - .digicert.com
+
+  tasks:
+
+    # ── Layer 1: wsl.conf ───────────────────────────────────────────────────
+
+    - name: Configure wsl.conf
+      copy:
+        dest: /etc/wsl.conf
+        content: |
+          [boot]
+          systemd = true
+
+          [automount]
+          enabled = false
+          mountFsTab = true
+
+          [interop]
+          enabled = false
+          appendWindowsPath = false
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Remind WSL restart
+
+    # ── Layer 2: agent user ─────────────────────────────────────────────────
+
+    - name: Create agent user
+      user:
+        name: "{{ agent_user }}"
+        shell: /bin/bash
+        create_home: true
+        groups: []
+        append: false
+
+    - name: Lock agent user password (no login via password)
+      user:
+        name: "{{ agent_user }}"
+        password_lock: true
+
+    - name: Restrict agent home permissions
+      file:
+        path: "{{ agent_home }}"
+        mode: "0700"
+        owner: "{{ agent_user }}"
+        group: "{{ agent_user }}"
+
+    - name: Create agent project mount root
+      file:
+        path: "{{ agent_home }}/_"
+        state: directory
+        owner: "{{ agent_user }}"
+        group: "{{ agent_user }}"
+        mode: "0700"
+
+    - name: Install acl package
+      apt:
+        name: acl
+        state: present
+        update_cache: false
+
+    - name: Set ACL on project root (existing files)
+      acl:
+        path: "{{ project_root }}"
+        entity: "{{ agent_user }}"
+        etype: user
+        permissions: rwX
+        recursive: true
+        state: present
+
+    - name: Set default ACL on project root (new files)
+      acl:
+        path: "{{ project_root }}"
+        entity: "{{ agent_user }}"
+        etype: user
+        permissions: rwX
+        default: true
+        recursive: true
+        state: present
+
+    - name: Install agent-session script
+      copy:
+        dest: /usr/local/bin/agent-session
+        mode: "0755"
+        owner: root
+        group: root
+        content: |
+          #!/bin/bash
+          set -euo pipefail
+
+          CMD="${1:-}"
+          PROJECT="${2:-}"
+
+          usage() {
+              echo "Usage: agent-session start <project> | stop <project> | list"
+              exit 1
+          }
+
+          case "$CMD" in
+              start)
+                  [[ -z "$PROJECT" ]] && usage
+                  [[ "$PROJECT" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "Invalid project name"; exit 1; }
+
+                  SRC="{{ project_root }}/$PROJECT"
+                  DST="{{ agent_home }}/_/$PROJECT"
+
+                  [[ -d "$SRC" ]] || { echo "Project not found: $SRC"; exit 1; }
+
+                  mkdir -p "$DST"
+                  if mountpoint -q "$DST"; then
+                      echo "Already mounted: $DST"
+                  else
+                      sudo mount --bind "$SRC" "$DST"
+                      echo "Mounted: $SRC → $DST"
+                  fi
+                  ;;
+              stop)
+                  [[ -z "$PROJECT" ]] && usage
+                  DST="{{ agent_home }}/_/$PROJECT"
+
+                  if mountpoint -q "$DST"; then
+                      sudo umount "$DST"
+                      rmdir "$DST"
+                      echo "Unmounted: $DST"
+                  else
+                      echo "Not mounted: $DST"
+                  fi
+                  ;;
+              list)
+                  mount | grep "{{ agent_home }}/_/" || echo "No active agent sessions"
+                  ;;
+              *)
+                  usage
+                  ;;
+          esac
+
+    - name: Configure sudoers for agent-session mount/umount
+      copy:
+        dest: /etc/sudoers.d/agent-session
+        content: |
+          {{ dev_user }} ALL=(root) NOPASSWD: /usr/bin/mount, /usr/bin/umount
+        owner: root
+        group: root
+        mode: "0440"
+      validate: visudo -cf %s
+
+    # ── Layer 3: SSH ────────────────────────────────────────────────────────
+
+    - name: Install openssh-server
+      apt:
+        name: openssh-server
+        state: present
+
+    - name: Enable and start sshd
+      systemd:
+        name: ssh
+        enabled: true
+        state: started
+
+    - name: Create agent .ssh directory
+      file:
+        path: "{{ agent_home }}/.ssh"
+        state: directory
+        owner: "{{ agent_user }}"
+        group: "{{ agent_user }}"
+        mode: "0700"
+
+    - name: Copy authorized_keys from dev user to agent user
+      copy:
+        src: "/home/{{ dev_user }}/.ssh/authorized_keys"
+        dest: "{{ agent_home }}/.ssh/authorized_keys"
+        remote_src: true
+        owner: "{{ agent_user }}"
+        group: "{{ agent_user }}"
+        mode: "0600"
+
+    # ── Layer 4: nftables ───────────────────────────────────────────────────
+
+    - name: Install nftables
+      apt:
+        name: nftables
+        state: present
+
+    - name: Create nftables.d directory
+      file:
+        path: /etc/nftables.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Deploy claude-restrict nftables rules
+      copy:
+        dest: /etc/nftables.d/claude-restrict.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          table inet claude_restrict {
+              chain output {
+                  type filter hook output priority filter; policy accept;
+
+                  meta skuid != {{ agent_user }} accept
+                  ct state established,related accept
+                  ip daddr 127.0.0.1 accept
+                  meta skuid {{ agent_user }} drop
+              }
+          }
+      notify: Reload nftables
+
+    - name: Deploy nftables.conf with include
+      copy:
+        dest: /etc/nftables.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          #!/usr/sbin/nft -f
+          include "/etc/nftables.d/*.conf"
+      notify: Reload nftables
+
+    - name: Enable nftables
+      systemd:
+        name: nftables
+        enabled: true
+        state: started
+
+    # ── Layer 4: Squid ──────────────────────────────────────────────────────
+
+    - name: Install squid
+      apt:
+        name: squid
+        state: present
+
+    - name: Deploy squid.conf
+      copy:
+        dest: /etc/squid/squid.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          http_port 127.0.0.1:3128
+
+          {% for domain in squid_whitelist %}
+          acl agent_allowed dstdomain {{ domain }}
+          {% endfor %}
+
+          acl SSL_ports port 443
+          acl CONNECT method CONNECT
+          http_access deny CONNECT !SSL_ports
+
+          http_access allow agent_allowed
+          http_access deny all
+
+          access_log /var/log/squid/agent-access.log
+      notify: Reload squid
+
+    - name: Enable and start squid
+      systemd:
+        name: squid
+        enabled: true
+        state: started
+
+    # ── agent .bashrc proxy vars ────────────────────────────────────────────
+
+    - name: Set proxy environment for agent user
+      blockinfile:
+        path: "{{ agent_home }}/.bashrc"
+        create: true
+        owner: "{{ agent_user }}"
+        group: "{{ agent_user }}"
+        mode: "0644"
+        marker: "# {mark} ANSIBLE MANAGED — agent proxy"
+        block: |
+          export http_proxy=http://127.0.0.1:3128
+          export https_proxy=http://127.0.0.1:3128
+          export no_proxy=localhost,127.0.0.1
+
+  # ── handlers ───────────────────────────────────────────────────────────────
+
+  handlers:
+
+    - name: Reload nftables
+      systemd:
+        name: nftables
+        state: restarted
+
+    - name: Reload squid
+      systemd:
+        name: squid
+        state: reloaded
+
+    - name: Remind WSL restart
+      debug:
+        msg: "wsl.conf changed — run 'wsl --shutdown' from Windows to apply"
